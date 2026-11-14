@@ -1,19 +1,37 @@
 
-const MODELS = [
-  "gemini-3.8-flash",
-  "gemini-3.7-flash",
-  "gemini-3.6-flash"
-];
-
-const sleep = (ms) =>
+const sleep = ms =>
   new Promise(resolve => setTimeout(resolve, ms));
 
-async function askGemini(apiKey, model, message) {
-  const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+async function getAvailableModels(apiKey) {
+  const response = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/models",
+    {
+      headers: {
+        "x-goog-api-key": apiKey
+      }
+    }
+  );
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const response = await fetch(url, {
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data.error?.message || "Could not list available models."
+    );
+  }
+
+  return (data.models || [])
+    .filter(model =>
+      (model.supportedGenerationMethods || [])
+        .includes("generateContent")
+    )
+    .map(model => model.name);
+}
+
+async function askGemini(apiKey, model, message) {
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent`,
+    {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -25,51 +43,55 @@ async function askGemini(apiKey, model, message) {
           parts: [{ text: message }]
         }]
       })
-    });
-
-    const data = await response.json();
-
-    if (response.ok) {
-      const answer = data.candidates?.[0]?.content?.parts
-        ?.map(part => part.text || "")
-        .join("");
-
-      if (answer) return answer;
-
-      throw new Error("The model returned an empty answer.");
     }
+  );
 
-    if (response.status === 503 && attempt === 0) {
-      await sleep(2000);
-      continue;
-    }
+  const data = await response.json();
 
+  if (!response.ok) {
     const error = new Error(
       data.error?.message || "Gemini request failed."
     );
-
     error.status = response.status;
     throw error;
   }
 
-  throw new Error("Model unavailable.");
-}
+  const answer = data.candidates?.[0]?.content?.parts
+    ?.map(part => part.text || "")
+    .join("");
 
-exports.handler = async (event) => {
-  if (event.httpMethod !== "POST") {
-    return {
-      statusCode: 405,
-      body: JSON.stringify({
-        error: "Method not allowed."
-      })
-    };
+  if (!answer) {
+    throw new Error("Gemini returned an empty answer.");
   }
 
+  return answer;
+}
+
+exports.handler = async event => {
   try {
     const apiKey = process.env.GEMINI_API_KEY;
 
     if (!apiKey) {
       throw new Error("GEMINI_API_KEY is missing in Netlify.");
+    }
+
+    // Diagnostic: list models available to this API key.
+    if (event.httpMethod === "GET") {
+      const models = await getAvailableModels(apiKey);
+
+      return {
+        statusCode: 200,
+        body: JSON.stringify({ models }, null, 2)
+      };
+    }
+
+    if (event.httpMethod !== "POST") {
+      return {
+        statusCode: 405,
+        body: JSON.stringify({
+          error: "Method not allowed."
+        })
+      };
     }
 
     const body = JSON.parse(event.body || "{}");
@@ -84,9 +106,28 @@ exports.handler = async (event) => {
       };
     }
 
+    const available = await getAvailableModels(apiKey);
+
+    const preferred = [
+      "models/gemini-3.8-flash",
+      "models/gemini-3.7-flash",
+      "models/gemini-3.6-flash"
+    ];
+
+    const models = [
+      ...preferred.filter(name => available.includes(name)),
+      ...available.filter(name => !preferred.includes(name))
+    ].slice(0, 3);
+
+    if (models.length === 0) {
+      throw new Error(
+        "No models supporting generateContent are available for this API key."
+      );
+    }
+
     let lastError;
 
-    for (const model of MODELS) {
+    for (const model of models) {
       try {
         const answer = await askGemini(
           apiKey,
@@ -105,23 +146,28 @@ exports.handler = async (event) => {
       } catch (error) {
         lastError = error;
 
-        // Do not hide authentication or request errors.
         if (
-          error.status &&
-          error.status !== 503 &&
-          error.status !== 429
+          error.status !== 429 &&
+          error.status !== 503
         ) {
-          throw error;
+          return {
+            statusCode: error.status || 500,
+            body: JSON.stringify({
+              error: error.message,
+              model
+            })
+          };
         }
+
+        await sleep(1000);
       }
     }
 
     return {
-      statusCode: 503,
+      statusCode: lastError?.status || 503,
       body: JSON.stringify({
-        error:
-          "All available Gemini models are currently busy. Please try again shortly.",
-        details: lastError?.message || "No model available."
+        error: lastError?.message || "All models failed.",
+        modelsTried: models
       })
     };
 
@@ -134,4 +180,4 @@ exports.handler = async (event) => {
     };
   }
 };
-      
+    
